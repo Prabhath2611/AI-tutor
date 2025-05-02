@@ -5,8 +5,8 @@ import re
 import datetime
 
 # Initialize the speech engine
-engine = pyttsx3.init()
-recognizer = sr.Recognizer()
+engine = pyttsx3.init)
+recognizer = sr.Recognizer(;
 
 def speak(text):
     """Speak the given text using TTS."""
