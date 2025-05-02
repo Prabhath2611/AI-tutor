@@ -50,7 +50,7 @@ def get_wikipedia_summary(query):
         return f"I couldn't find anything on Wikipedia for '{query}'."
     except Exception as e:
         return f"An error occurred while searching: {e}"
-
+#changes
 def process_query(query):
     """Process the user's query and return a response."""
     if any(op in query for op in ['+', '-', '*', '/', 'plus', 'minus', 'times', 'divided']):
