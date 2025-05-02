@@ -1,1 +1,1 @@
-It is an AI tutor chatbot
+It is an AI tutor chatbot.
