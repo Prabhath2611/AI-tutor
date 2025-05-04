@@ -1,0 +1,822 @@
+"""
+Multimodal AI Classroom Assistant
+================================
+
+This system integrates text, voice, and visual processing to create an 
+interactive AI assistant for classroom environments. It provides real-time
+responses to student queries while monitoring engagement levels.
+
+Main components:
+1. Text Processing: NLP-based query understanding and response generation
+2. Voice Processing: Speech-to-text and text-to-speech capabilities
+3. Visual Processing: Image/diagram generation and facial expression analysis
+4. Engagement Monitoring: Tracking attention levels and suggesting interventions
+5. Main Controller: Orchestrating all components and managing the interaction flow
+
+Dependencies:
+- transformers (Hugging Face)
+- pytorch
+- opencv-python
+- numpy
+- sounddevice
+- matplotlib
+- pillow
+- facenet-pytorch
+"""
+#Code starts from below line.
+
+import os
+import time
+import json
+import numpy as np
+import torch
+import cv2
+import sounddevice as sd
+import matplotlib.pyplot as plt
+from PIL import Image
+from threading import Thread, Lock
+
+# For text processing
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+# For speech processing  
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
+
+# For visual processing
+from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
+from facenet_pytorch import MTCNN, InceptionResnetV1
+
+class TextProcessor:
+    """
+    Handles text-based queries and generates responses using a large language model.
+    """
+    def __init__(self, model_name="google/flan-t5-base", device="cuda" if torch.cuda.is_available() else "cpu"):
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        self.qa_pipeline = pipeline(
+            "question-answering",
+            model=model_name,
+            tokenizer=self.tokenizer,
+            device=0 if device == "cuda" else -1
+        )
+        
+        # Knowledge base for educational content
+        self.knowledge_base = self._load_knowledge_base()
+        
+    def _load_knowledge_base(self):
+        """Load educational content from JSON file"""
+        try:
+            with open("educational_content.json", "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            # Create a simple default knowledge base
+            knowledge = {
+                "math": {
+                    "algebra": "Algebra is a branch of mathematics dealing with symbols...",
+                    "calculus": "Calculus is the mathematical study of continuous change..."
+                },
+                "science": {
+                    "physics": "Physics is the natural science that studies matter, motion...",
+                    "chemistry": "Chemistry is the scientific discipline involved with elements..."
+                }
+            }
+            with open("educational_content.json", "w") as f:
+                json.dump(knowledge, f, indent=4)
+            return knowledge
+    
+    def process_query(self, query, context=None):
+        """
+        Process a text query and generate a response.
+        
+        Args:
+            query (str): The question or request from the student
+            context (str, optional): Additional context to help with response generation
+            
+        Returns:
+            dict: Response containing text answer and relevant metadata
+        """
+        # Determine subject matter from query
+        subjects = ["math", "science", "history", "language", "art"]
+        relevant_context = ""
+        
+        if context:
+            relevant_context = context
+        else:
+            # Simple context extraction based on keywords
+            for subject, content in self.knowledge_base.items():
+                if subject.lower() in query.lower():
+                    for subtopic, info in content.items():
+                        if subtopic.lower() in query.lower():
+                            relevant_context = info
+                            break
+        
+        # Generate response using the model
+        if relevant_context:
+            result = self.qa_pipeline(question=query, context=relevant_context)
+            confidence = result["score"]
+        else:
+            # If no specific context, use general model capabilities
+            inputs = self.tokenizer(f"Question: {query}\nAnswer:", return_tensors="pt").to(self.device)
+            output = self.model.generate(
+                inputs["input_ids"],
+                max_length=150,
+                num_beams=4,
+                early_stopping=True
+            )
+            result = {"answer": self.tokenizer.decode(output[0], skip_special_tokens=True)}
+            confidence = 0.7  # Default confidence
+            
+        # Add metadata for multimodal enhancement opportunities
+        needs_visual = self._needs_visual_aid(query)
+        
+        return {
+            "text_response": result["answer"],
+            "confidence": confidence,
+            "needs_visual": needs_visual,
+            "subject": self._identify_subject(query, subjects)
+        }
+    
+    def _needs_visual_aid(self, query):
+        """Determine if the query would benefit from visual aids"""
+        visual_keywords = ["show", "diagram", "graph", "picture", "draw", "visualize", "plot"]
+        return any(keyword in query.lower() for keyword in visual_keywords)
+    
+    def _identify_subject(self, query, subjects):
+        """Identify the educational subject of the query"""
+        for subject in subjects:
+            if subject.lower() in query.lower():
+                return subject
+        return "general"
+
+
+class VoiceProcessor:
+    """
+    Handles speech-to-text and text-to-speech conversion.
+    """
+    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
+        self.device = device
+        
+        # Initialize speech-to-text components
+        self.stt_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+        self.stt_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h").to(device)
+        
+        # Initialize text-to-speech components
+        self.tts_processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
+        self.tts_model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts").to(device)
+        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device)
+        
+        # Audio recording settings
+        self.sample_rate = 16000
+        self.recording = False
+        self.audio_buffer = []
+        
+    def start_recording(self):
+        """Start recording audio from microphone"""
+        self.recording = True
+        self.audio_buffer = []
+        
+        def callback(indata, frames, time, status):
+            if self.recording:
+                self.audio_buffer.append(indata.copy())
+        
+        # Start recording stream
+        self.stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            callback=callback
+        )
+        self.stream.start()
+        
+    def stop_recording(self):
+        """Stop recording and process the captured audio"""
+        self.recording = False
+        self.stream.stop()
+        self.stream.close()
+        
+        # Combine recorded audio chunks
+        if not self.audio_buffer:
+            return None
+            
+        audio_data = np.concatenate(self.audio_buffer, axis=0)
+        return audio_data.flatten()
+    
+    def speech_to_text(self, audio_data=None):
+        """
+        Convert speech to text.
+        
+        Args:
+            audio_data (numpy.ndarray, optional): Audio data to process. If None, records new audio.
+            
+        Returns:
+            str: Transcribed text
+        """
+        if audio_data is None:
+            self.start_recording()
+            time.sleep(5)  # Record for 5 seconds
+            audio_data = self.stop_recording()
+            
+        if audio_data is None:
+            return ""
+            
+        # Process audio with speech-to-text model
+        inputs = self.stt_processor(
+            audio_data, 
+            sampling_rate=self.sample_rate, 
+            return_tensors="pt"
+        ).to(self.device)
+        
+        with torch.no_grad():
+            logits = self.stt_model(inputs.input_values).logits
+            
+        predicted_ids = torch.argmax(logits, dim=-1)
+        transcription = self.stt_processor.batch_decode(predicted_ids)[0]
+        
+        return transcription
+    
+    def text_to_speech(self, text):
+        """
+        Convert text to speech.
+        
+        Args:
+            text (str): Text to convert to speech
+            
+        Returns:
+            numpy.ndarray: Audio waveform
+        """
+        # Process text for TTS
+        inputs = self.tts_processor(text=text, return_tensors="pt").to(self.device)
+        
+        # Generate speech with a default speaker embedding
+        speaker_embeddings = torch.zeros((1, 512)).to(self.device)  # Default speaker
+        
+        with torch.no_grad():
+            speech = self.tts_model.generate_speech(
+                inputs["input_ids"], 
+                speaker_embeddings, 
+                vocoder=self.vocoder
+            )
+        
+        return speech.cpu().numpy()
+    
+    def play_audio(self, audio_data):
+        """Play audio through speakers"""
+        sd.play(audio_data, self.sample_rate)
+        sd.wait()
+
+
+class VisualProcessor:
+    """
+    Handles image processing, including diagram generation and facial expression analysis.
+    """
+    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
+        self.device = device
+        
+        # Initialize facial detection and recognition
+        self.face_detector = MTCNN(keep_all=True, device=device)
+        self.face_encoder = InceptionResnetV1(pretrained='vggface2').to(device).eval()
+        
+        # Initialize image captioning model
+        self.image_processor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+        self.captioning_model = VisionEncoderDecoderModel.from_pretrained("nlpconnect/vit-gpt2-image-captioning").to(device)
+        self.caption_tokenizer = AutoTokenizer.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+        
+        # For camera capture
+        self.camera = None
+        self.camera_lock = Lock()
+        
+    def initialize_camera(self, camera_id=0):
+        """Initialize the camera for video capture"""
+        with self.camera_lock:
+            if self.camera is None:
+                self.camera = cv2.VideoCapture(camera_id)
+                if not self.camera.isOpened():
+                    print("Error: Could not open camera.")
+                    self.camera = None
+    
+    def release_camera(self):
+        """Release the camera resource"""
+        with self.camera_lock:
+            if self.camera is not None:
+                self.camera.release()
+                self.camera = None
+    
+    def capture_image(self):
+        """Capture an image from the camera"""
+        with self.camera_lock:
+            if self.camera is None:
+                self.initialize_camera()
+                
+            if self.camera is None:
+                return None
+                
+            ret, frame = self.camera.read()
+            if not ret:
+                print("Error: Failed to capture image")
+                return None
+                
+            return frame
+    
+    def analyze_facial_expressions(self, image=None):
+        """
+        Analyze facial expressions to detect engagement level.
+        
+        Args:
+            image (numpy.ndarray, optional): Image to analyze. If None, captures new image.
+            
+        Returns:
+            dict: Dictionary containing engagement metrics
+        """
+        if image is None:
+            image = self.capture_image()
+            
+        if image is None:
+            return {"engagement": 0.5, "attention": 0.5, "emotion": "unknown"}
+            
+        # Convert to RGB for face detection
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Detect faces
+        faces, probs = self.face_detector.detect(rgb_image, landmarks=True)
+        
+        if faces is None or len(faces) == 0:
+            return {"engagement": 0.5, "attention": 0.5, "emotion": "no face detected"}
+        
+        # Simple engagement metrics (placeholder for more sophisticated analysis)
+        # In a real implementation, this would use a trained emotion recognition model
+        engagement_metrics = {
+            "engagement": 0.7,  # Placeholder value
+            "attention": 0.8,   # Placeholder value
+            "emotion": "neutral",
+            "face_count": len(faces)
+        }
+        
+        return engagement_metrics
+    
+    def generate_visual_aid(self, topic, query):
+        """
+        Generate or retrieve an appropriate visual aid for the topic.
+        
+        Args:
+            topic (str): The educational topic
+            query (str): The specific query
+            
+        Returns:
+            PIL.Image: Generated visual aid
+        """
+        # This is a placeholder. In a real implementation, this would:
+        # 1. Look up relevant diagrams in a database
+        # 2. Generate plots or diagrams based on the query
+        # 3. Use a generative model to create educational visuals
+        
+        # For now, we'll create a simple diagram based on the topic
+        fig, ax = plt.figure(figsize=(8, 6)), plt.gca()
+        
+        if "graph" in query.lower() or "plot" in query.lower():
+            # Generate a simple plot
+            x = np.linspace(0, 10, 100)
+            y = np.sin(x)
+            ax.plot(x, y)
+            ax.set_title(f"Plot for: {topic}")
+            ax.set_xlabel("X axis")
+            ax.set_ylabel("Y axis")
+            ax.grid(True)
+            
+        elif "diagram" in query.lower():
+            # Generate a simple diagram
+            ax.axis('off')
+            if "cycle" in query.lower():
+                # Draw a cycle diagram
+                circle = plt.Circle((0.5, 0.5), 0.4, fill=False)
+                ax.add_patch(circle)
+                # Add some labels around the circle
+                for i, label in enumerate(["Stage 1", "Stage 2", "Stage 3", "Stage 4"]):
+                    angle = i * 90 * np.pi / 180
+                    x = 0.5 + 0.4 * np.cos(angle)
+                    y = 0.5 + 0.4 * np.sin(angle)
+                    ax.text(x, y, label, ha='center', va='center', bbox=dict(facecolor='white', alpha=0.7))
+            else:
+                # Default diagram - a simple flowchart
+                nodes = [(0.2, 0.8, "Start"), (0.5, 0.6, "Process"), (0.8, 0.4, "Decision"), (0.5, 0.2, "End")]
+                for x, y, label in nodes:
+                    ax.add_patch(plt.Rectangle((x-0.1, y-0.05), 0.2, 0.1, fill=True, alpha=0.3))
+                    ax.text(x, y, label, ha='center', va='center')
+                # Draw arrows between nodes
+                ax.arrow(0.2, 0.75, 0.2, -0.1, head_width=0.02, head_length=0.02, fc='black', ec='black')
+                ax.arrow(0.5, 0.55, 0.2, -0.1, head_width=0.02, head_length=0.02, fc='black', ec='black')
+                ax.arrow(0.8, 0.35, -0.2, -0.1, head_width=0.02, head_length=0.02, fc='black', ec='black')
+            
+        else:
+            # Generic educational visual
+            ax.text(0.5, 0.5, f"Visual Aid for: {topic}", ha='center', va='center', fontsize=20)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.axis('off')
+        
+        # Convert matplotlib figure to PIL image
+        fig.canvas.draw()
+        img = Image.frombytes('RGB', fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
+        plt.close(fig)
+        
+        return img
+    
+    def analyze_image(self, image):
+        """
+        Analyze an image and generate a description.
+        
+        Args:
+            image (PIL.Image or numpy.ndarray): Image to analyze
+            
+        Returns:
+            str: Image description
+        """
+        if isinstance(image, np.ndarray):
+            # Convert OpenCV image to PIL
+            image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            
+        # Process the image
+        inputs = self.image_processor(images=image, return_tensors="pt").to(self.device)
+        
+        # Generate caption
+        with torch.no_grad():
+            output_ids = self.captioning_model.generate(
+                inputs.pixel_values,
+                max_length=50,
+                num_beams=4,
+                early_stopping=True
+            )
+        
+        # Decode the caption
+        caption = self.caption_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        
+        return caption
+
+
+class EngagementMonitor:
+    """
+    Monitors student engagement and provides intervention suggestions.
+    """
+    def __init__(self, visual_processor):
+        self.visual_processor = visual_processor
+        self.engagement_history = []
+        self.engagement_threshold = 0.5
+        self.monitoring = False
+        self.monitoring_thread = None
+        
+    def start_monitoring(self, interval=5):
+        """
+        Start continuous engagement monitoring.
+        
+        Args:
+            interval (int): Time between engagement checks in seconds
+        """
+        self.monitoring = True
+        
+        def monitor_loop():
+            while self.monitoring:
+                metrics = self.visual_processor.analyze_facial_expressions()
+                self.engagement_history.append({
+                    "timestamp": time.time(),
+                    "metrics": metrics
+                })
+                time.sleep(interval)
+        
+        self.monitoring_thread = Thread(target=monitor_loop)
+        self.monitoring_thread.daemon = True
+        self.monitoring_thread.start()
+        
+    def stop_monitoring(self):
+        """Stop engagement monitoring"""
+        self.monitoring = False
+        if self.monitoring_thread:
+            self.monitoring_thread.join(timeout=1)
+            
+    def check_engagement(self):
+        """
+        Check current engagement level and provide suggestions if needed.
+        
+        Returns:
+            dict: Engagement status and suggestions
+        """
+        metrics = self.visual_processor.analyze_facial_expressions()
+        current_engagement = metrics["engagement"]
+        
+        if current_engagement < self.engagement_threshold:
+            return {
+                "engaged": False,
+                "level": current_engagement,
+                "suggestions": self._get_intervention_suggestions(metrics)
+            }
+        else:
+            return {
+                "engaged": True,
+                "level": current_engagement,
+                "suggestions": []
+            }
+            
+    def _get_intervention_suggestions(self, metrics):
+        """Generate intervention suggestions based on engagement metrics"""
+        suggestions = []
+        
+        # Different intervention strategies based on detected issues
+        if metrics["emotion"] == "confused":
+            suggestions.append("Try rephrasing the explanation using simpler terms")
+            suggestions.append("Provide a visual representation of the concept")
+            
+        elif metrics["emotion"] == "bored":
+            suggestions.append("Introduce an interactive element or question")
+            suggestions.append("Connect the topic to real-world applications")
+            suggestions.append("Use a more engaging example")
+            
+        elif metrics["emotion"] == "distracted":
+            suggestions.append("Use a brief attention-grabbing activity")
+            suggestions.append("Ask a direct question to re-engage")
+            
+        # Default suggestions if emotion can't be determined precisely
+        if not suggestions:
+            suggestions = [
+                "Try using a different modality (visual, audio, text)",
+                "Ask a thought-provoking question",
+                "Use a real-world example to illustrate the concept"
+            ]
+            
+        return suggestions
+        
+    def get_engagement_trend(self, minutes=10):
+        """
+        Analyze engagement trend over the last specified minutes.
+        
+        Args:
+            minutes (int): Time period in minutes to analyze
+            
+        Returns:
+            dict: Engagement trend analysis
+        """
+        current_time = time.time()
+        cutoff_time = current_time - (minutes * 60)
+        
+        # Filter recent engagement data
+        recent_data = [
+            entry for entry in self.engagement_history 
+            if entry["timestamp"] >= cutoff_time
+        ]
+        
+        if not recent_data:
+            return {"trend": "unknown", "average": 0.5, "data_points": 0}
+            
+        # Calculate average engagement
+        engagement_values = [entry["metrics"]["engagement"] for entry in recent_data]
+        average_engagement = sum(engagement_values) / len(engagement_values)
+        
+        # Determine trend
+        if len(engagement_values) >= 3:
+            first_half = engagement_values[:len(engagement_values)//2]
+            second_half = engagement_values[len(engagement_values)//2:]
+            
+            first_avg = sum(first_half) / len(first_half)
+            second_avg = sum(second_half) / len(second_half)
+            
+            if second_avg > first_avg + 0.1:
+                trend = "increasing"
+            elif second_avg < first_avg - 0.1:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "insufficient data"
+            
+        return {
+            "trend": trend,
+            "average": average_engagement,
+            "data_points": len(recent_data)
+        }
+
+
+class ClassroomAIAssistant:
+    """
+    Main controller class that orchestrates all components of the AI assistant.
+    """
+    def __init__(self):
+        print("Initializing Classroom AI Assistant...")
+        
+        # Determine device for computation
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {self.device}")
+        
+        # Initialize components
+        self.text_processor = TextProcessor(device=self.device)
+        print("Text processor initialized")
+        
+        self.visual_processor = VisualProcessor(device=self.device)
+        print("Visual processor initialized")
+        
+        self.voice_processor = VoiceProcessor(device=self.device)
+        print("Voice processor initialized")
+        
+        self.engagement_monitor = EngagementMonitor(self.visual_processor)
+        print("Engagement monitor initialized")
+        
+        # Session state
+        self.conversation_history = []
+        self.active = False
+        
+    def start(self):
+        """Start the AI assistant"""
+        self.active = True
+        self.visual_processor.initialize_camera()
+        self.engagement_monitor.start_monitoring()
+        print("Classroom AI Assistant started and ready for interaction")
+        
+    def stop(self):
+        """Stop the AI assistant and release resources"""
+        self.active = False
+        self.engagement_monitor.stop_monitoring()
+        self.visual_processor.release_camera()
+        print("Classroom AI Assistant stopped")
+        
+    def process_text_query(self, query):
+        """
+        Process a text query and generate a multimodal response.
+        
+        Args:
+            query (str): The text query from the student
+            
+        Returns:
+            dict: Multimodal response with text, visuals, and engagement suggestions
+        """
+        # Add query to conversation history
+        self.conversation_history.append({"role": "student", "content": query, "type": "text"})
+        
+        # Check student engagement
+        engagement_status = self.engagement_monitor.check_engagement()
+        
+        # Get text response
+        context = self._get_conversation_context()
+        text_response = self.text_processor.process_query(query, context)
+        
+        response = {
+            "text": text_response["text_response"],
+            "engagement": engagement_status
+        }
+        
+        # Add visual aid if needed
+        if text_response["needs_visual"]:
+            visual_aid = self.visual_processor.generate_visual_aid(
+                text_response["subject"], 
+                query
+            )
+            response["visual"] = visual_aid
+            
+        # Add response to conversation history
+        self.conversation_history.append({
+            "role": "assistant", 
+            "content": text_response["text_response"],
+            "type": "multimodal"
+        })
+        
+        return response
+        
+    def process_voice_query(self):
+        """
+        Process a voice query by converting speech to text and generating a response.
+        
+        Returns:
+            dict: Multimodal response with text, audio, and optional visuals
+        """
+        print("Listening for voice query...")
+        
+        # Convert speech to text
+        transcription = self.voice_processor.speech_to_text()
+        
+        if not transcription:
+            return {"error": "Could not understand audio input"}
+            
+        print(f"Transcribed: {transcription}")
+        
+        # Process the transcribed query
+        response = self.process_text_query(transcription)
+        
+        # Convert response text to speech
+        speech = self.voice_processor.text_to_speech(response["text"])
+        response["audio"] = speech
+        
+        return response
+        
+    def process_image_query(self, image):
+        """
+        Process an image-based query.
+        
+        Args:
+            image (numpy.ndarray or PIL.Image): Image to analyze
+            
+        Returns:
+            dict: Response with image analysis and relevant educational content
+        """
+        # Analyze the image
+        image_description = self.visual_processor.analyze_image(image)
+        
+        # Generate a response based on the image content
+        context = f"Image description: {image_description}"
+        text_response = self.text_processor.process_query(
+            f"Explain the educational concepts related to this image: {image_description}",
+            context
+        )
+        
+        # Add to conversation history
+        self.conversation_history.append({
+            "role": "student", 
+            "content": "Image uploaded", 
+            "type": "image"
+        })
+        
+        self.conversation_history.append({
+            "role": "assistant", 
+            "content": text_response["text_response"],
+            "type": "text"
+        })
+        
+        return {
+            "image_description": image_description,
+            "text": text_response["text_response"]
+        }
+        
+    def _get_conversation_context(self):
+        """Extract context from conversation history"""
+        if len(self.conversation_history) <= 1:
+            return ""
+            
+        # Get last few turns of conversation
+        recent_history = self.conversation_history[-5:] if len(self.conversation_history) > 5 else self.conversation_history
+        
+        context = ""
+        for entry in recent_history:
+            if entry["role"] == "student":
+                context += f"Student: {entry['content']}\n"
+            else:
+                context += f"Assistant: {entry['content']}\n"
+                
+        return context
+        
+    def get_engagement_report(self):
+        """
+        Generate a report on student engagement.
+        
+        Returns:
+            dict: Engagement statistics and recommendations
+        """
+        # Get current engagement status
+        current = self.engagement_monitor.check_engagement()
+        
+        # Get trend over last 15 minutes
+        trend = self.engagement_monitor.get_engagement_trend(minutes=15)
+        
+        return {
+            "current": current,
+            "trend": trend,
+            "recommendations": current["suggestions"] if not current["engaged"] else []
+        }
+
+
+# Example usage script
+def main():
+    """Example usage of the Classroom AI Assistant"""
+    print("Starting Classroom AI Assistant demo...")
+    
+    # Initialize the assistant
+    assistant = ClassroomAIAssistant()
+    assistant.start()
+    
+    try:
+        # Example text query
+        print("\n--- Processing text query ---")
+        text_response = assistant.process_text_query("Can you explain how photosynthesis works?")
+        print(f"Text response: {text_response['text']}")
+        if "visual" in text_response:
+            print("Visual aid generated")
+            
+        # Example voice interaction (simulated in this demo)
+        print("\n--- Processing voice query (simulated) ---")
+        # In a real application, this would record audio from the microphone
+        # For demo purposes, we'll simulate by directly processing a text query
+        voice_response = assistant.process_text_query("What is the Pythagorean theorem?")
+        print(f"Response to voice query: {voice_response['text']}")
+        
+        # Example engagement monitoring
+        print("\n--- Checking student engagement ---")
+        engagement_report = assistant.get_engagement_report()
+        print(f"Current engagement level: {engagement_report['current']['level']}")
+        print(f"Engagement trend: {engagement_report['trend']['trend']}")
+        
+        if engagement_report['recommendations']:
+            print("Recommendations to improve engagement:")
+            for rec in engagement_report['recommendations']:
+                print(f"- {rec}")
+                
+    finally:
+        # Clean up resources
+        assistant.stop()
+        print("Demo completed")
+
+
+if __name__ == "__main__":
+    main()
